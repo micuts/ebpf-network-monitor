@@ -1,0 +1,2 @@
+﻿Requests/sec: 43.53
+Success: 653 | Errors: 0

@@ -1,0 +1,6 @@
+*.o
+src/syn_defender
+src/map_reader
+src/ip_reader
+all_c_sources.txt
+*.log
