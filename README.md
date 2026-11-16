@@ -1,609 +1,427 @@
-# BÁO CÁO KỸ THUẬT CHUYÊN SÂU: GIÁM SÁT MẠNG TỐC ĐỘ CAO VÀ PHÒNG CHỐNG TẤN CÔNG TCP SYN FLOOD DỰA TRÊN CÔNG NGHỆ eBPF/XDP
+# eBPF/XDP Network Monitor & TCP SYN Flood Mitigation
+
+Hệ thống giám sát lưu lượng mạng và phòng chống tấn công từ chối dịch vụ **TCP SYN Flood** hiệu năng cao dựa trên công nghệ **eBPF / XDP (eXpress Data Path)** trên nhân Linux. Hệ thống cho phép lọc và loại bỏ gói tin độc hại (`XDP_DROP`) ngay tại tầng driver/card mạng trước khi gói tin đi sâu vào tầng mạng của hệ điều hành (Network Stack), giúp tiết kiệm tối đa tài nguyên CPU và duy trì kết nối ổn định cho người dùng hợp lệ.
 
 ---
 
-## MỤC LỤC
-1. [Tổng quan và Đặt vấn đề](#1-tổng-quan-và-đặt-vấn-đề)
-2. [Cơ sở lý thuyết về eBPF, XDP và Tấn công TCP SYN Flood](#2-cơ-sở-lý-thuyết-về-ebpf-xdp-và-tấn-công-tcp-syn-flood)
-3. [Kiến trúc hệ thống và Luồng xử lý gói tin](#3-kiến-trúc-hệ-thống-và-luồng-xử-lý-gói-tin)
-4. [Thiết kế cấu trúc dữ liệu (eBPF Maps)](#4-thiết-kế-cấu-trúc-dữ-liệu-ebpf-maps)
-5. [Triển khai mã nguồn chi tiết (Kernel Space & User Space)](#5-triển-khai-mã-nguồn-chi-tiết-kernel-space--user-space)
-6. [Quy trình biên dịch và Hướng dẫn vận hành](#6-quy-trình-biên-dịch-và-hướng-dẫn-vận-hành)
-7. [Kịch bản kiểm thử, Đánh giá hiệu năng và Phân tích kết quả](#7-kịch-bản-kiểm-thử-đánh-giá-hiệu-năng-và-phân-tích-kết-quả)
-8. [Hạn chế hiện tại và Hướng phát triển](#8-hạn-chế-hiện-tại-và-hướng-phát-triển)
+## 1. Kiến trúc hệ thống & Mô hình thực nghiệm
+
+### 1.1. Kiến trúc 2 tầng (Kernel Space & User Space)
+* **Kernel Space (`bpf/`):** Các chương trình XDP viết bằng ngôn ngữ C bị giới hạn (Restricted C), biên dịch sang bytecode eBPF bằng `clang` và gắn trực tiếp vào giao diện mạng `ens160`. Giao tiếp dữ liệu tốc độ cao thông qua các cấu trúc **BPF Maps**.
+* **User Space (`src/`):** Các chương trình điều khiển và giám sát viết bằng C sử dụng thư viện `libbpf`. Đọc thống kê theo thời gian thực mỗi giây, tính toán tốc độ gói tin (`SYN/s`), phát hiện bất thường vượt ngưỡng và cập nhật danh sách chặn (`blocklist`) xuống Kernel.
+
+### 1.2. Mô hình mạng thử nghiệm 3 máy (Bridged LAN)
+Tất cả các máy tham gia thực nghiệm được cấu hình ở chế độ **Bridged Network** để nằm ngang hàng trên cùng một lớp mạng nội bộ LAN (`192.168.1.0/24`), đảm bảo ghi nhận đúng địa chỉ IP nguồn thực tế của từng máy:
+
+| Vai trò | Hệ điều hành / Nền tảng | Card mạng | Địa chỉ IP | Chức năng trong kịch bản |
+| :--- | :--- | :--- | :--- | :--- |
+| **Victim / Defender** | Ubuntu Server 24.04 (`victim1`) | `ens160` | `192.168.1.x` | Máy chủ mục tiêu chạy web service & gắn bộ lọc XDP/eBPF |
+| **Legitimate Client** | Windows 11 (Host vật lý) | Wi-Fi / LAN | `192.168.1.14` | Người dùng hợp lệ gửi truy cập HTTP/TCP bình thường |
+| **Attacker** | Kali Linux (VM trên máy vật lý 2) | `eth0` | `192.168.1.17` | Máy tấn công sử dụng `hping3` phát lưu lượng TCP SYN Flood |
 
 ---
 
-## 1. Tổng quan và Đặt vấn đề
-
-### 1.1. Bối cảnh
-Trong hạ tầng mạng hiện đại với tốc độ truyền tải đạt mức $10\text{Gbps}$ đến $100\text{Gbps}$, các cuộc tấn công Từ chối dịch vụ phân tán (DDoS), đặc biệt là tấn công ở tầng Giao vận (Layer 4) như **TCP SYN Flood**, ngày càng trở nên phổ biến với lưu lượng gói tin cực lớn (hàng triệu gói tin mỗi giây - Mpps).
-
-### 1.2. Hạn chế của các giải pháp truyền thống
-Các công cụ tường lửa truyền thống trên hệ điều hành Linux (như `iptables`, `nftables` dựa trên khung làm việc `Netfilter`) hoạt động ở tầng sâu bên trong Network Stack của nhân hệ điều hành (Kernel Space). Để một gói tin đi tới được `iptables`, nhân Linux bắt buộc phải thực hiện hàng loạt tác vụ tốn kém tài nguyên:
-* Cấp phát bộ nhớ động cho cấu trúc dữ liệu đại diện gói tin (`sk_buff` - Socket Buffer).
-* Phân tích cú pháp các lớp giao thức (Ethernet, IP, TCP/UDP).
-* Đi qua nhiều hook khác nhau của Netfilter.
-
-Khi xảy ra tấn công SYN Flood cường độ cao, quá trình cấp phát `sk_buff` và xử lý ngắt (interrupts) sẽ nhanh chóng làm cạn kiệt tài nguyên CPU và bộ nhớ RAM, dẫn đến sập hệ thống ngay cả trước khi quy tắc chặn của tường lửa kịp phát huy tác dụng.
-
-### 1.3. Mục tiêu đề tài
-Xây dựng một hệ thống phòng thủ và giám sát lưu lượng mạng hiệu năng cao ứng dụng công nghệ **eBPF (Extended Berkeley Packet Filter)** kết hợp với **XDP (eXpress Data Path)** nhằm:
-1. Chặn đứng các gói tin tấn công TCP SYN Flood ngay tại lớp trình điều khiển card mạng (NIC Driver) trước khi hệ điều hành cấp phát `sk_buff`.
-2. Theo dõi thời gian thực (Real-time Monitoring) thông lượng mạng (PPS, Bandwidth) và danh sách các địa chỉ IP độc hại đang bị chặn.
-3. Giảm thiểu tối đa mức tiêu thụ CPU trong điều kiện tải cao.
-
----
-
-## 2. Cơ sở lý thuyết về eBPF, XDP và Tấn công TCP SYN Flood
-
-### 2.1. Công nghệ eBPF (Extended Berkeley Packet Filter)
-**eBPF** là một công nghệ cách mạng trong nhân Linux (từ phiên bản 4.x trở lên), cho phép thực thi các chương trình sandbox (môi trường cô lập) trực tiếp trong không gian nhân (Kernel Space) mà không cần phải biên dịch lại nhân hay tải thêm các mô-đun nhân (Kernel Modules) tiềm ẩn nguy cơ gây lỗi hệ thống (Kernel Panic).
-* **eBPF Verifier:** Trình kiểm duyệt tĩnh đảm bảo mã bytecode an toàn, không chứa vòng lặp vô tận, không truy cập bộ nhớ ngoài vùng cho phép.
-* **JIT Compiler:** Trình biên dịch Just-In-Time chuyển đổi bytecode eBPF sang mã máy gốc (x86_64, ARM64) giúp tốc độ thực thi ngang ngửa mã C biên dịch trực tiếp.
-
-### 2.2. XDP (eXpress Data Path)
-**XDP** là một điểm gắn kết (hook) hiệu năng cao của eBPF nằm ở tầng thấp nhất của đường đi gói tin trong nhân Linux — ngay tại trình điều khiển của card mạng (NIC Driver) khi gói tin vừa được chuyển vào bộ nhớ qua DMA (Direct Memory Access).
-
-Các hành động (Return Codes) của chương trình XDP:
-* `XDP_DROP`: Hủy gói tin ngay lập tức tại driver (chi phí CPU thấp nhất).
-* `XDP_PASS`: Cho phép gói tin đi tiếp lên Network Stack thông thường của Linux.
-* `XDP_TX`: Gửi ngược gói tin trở lại chính card mạng vừa nhận nó.
-* `XDP_REDIRECT`: Chuyển hướng gói tin sang một card mạng khác hoặc đưa lên User Space qua `AF_XDP`.
-* `XDP_ABORTED`: Hủy gói tin và báo lỗi (dùng cho mục đích gỡ lỗi).
-
-Các chế độ hoạt động (Attach Modes) của XDP:
-1. **Native Mode (`XDP_FLAGS_DRV_MODE`):** Chạy trực tiếp trong driver của card mạng hỗ trợ XDP. Hiệu năng cao nhất.
-2. **Offloaded Mode (`XDP_FLAGS_HW_MODE`):** Chạy trực tiếp trên chip xử lý của card mạng thông minh (SmartNIC).
-3. **Generic Mode (`XDP_FLAGS_SKB_MODE`):** Chạy sau khi đã cấp phát `sk_buff`. Dùng để kiểm thử trên các card mạng ảo hoặc driver cũ không hỗ trợ Native XDP.
-
-### 2.3. Cơ chế tấn công TCP SYN Flood
-Trong quá trình thiết lập kết nối TCP chuẩn (Bắt tay 3 bước - 3-way Handshake):
-1. Client gửi gói tin có bật cờ `SYN` tới Server.
-2. Server nhận gói tin, cấp phát tài nguyên trong hàng đợi kết nối bán mở (**SYN Queue**) và phản hồi lại bằng gói `SYN-ACK`.
-3. Client phản hồi lại gói `ACK` để hoàn tất kết nối.
-
-**Kịch bản tấn công:** Kẻ tấn công gửi hàng loạt gói tin `SYN` (thường giả mạo địa chỉ IP nguồn - IP Spoofing) nhưng không bao giờ gửi lại gói `ACK`. Hàng đợi SYN Queue của Server nhanh chóng bị lấp đầy, khiến các người dùng hợp lệ không thể thiết lập kết nối mới.
-
----
-
-## 3. Kiến trúc hệ thống và Luồng xử lý gói tin
-
-Hệ thống được chia thành 2 phân hệ độc lập giao tiếp với nhau thông qua cơ chế bộ nhớ chia sẻ **eBPF Maps**:
-
-1. **Kernel Space (XDP Engine - Viết bằng C):** Chịu trách nhiệm phân tích header gói tin (Ethernet $\rightarrow$ IPv4 $\rightarrow$ TCP), thống kê lưu lượng, tính toán tốc độ gói tin `SYN` theo từng địa chỉ IP nguồn và đưa ra quyết định `XDP_DROP` hoặc `XDP_PASS`.
-2. **User Space (Control Plane & Monitor - Viết bằng C với thư viện `libbpf`):** Chịu trách nhiệm nạp bytecode eBPF vào nhân, gắn vào giao diện mạng (Network Interface), đọc dữ liệu từ eBPF Maps mỗi giây để hiển thị giao diện giám sát (CLI Dashboard) và dọn dẹp tài nguyên khi thoát.
-
-### Sơ đồ luồng xử lý gói tin (Packet Processing Pipeline)
+## 2. Cấu trúc thư mục & Chi tiết mã nguồn (Source Code)
 
 ```text
-[ Card Mạng (NIC) ]
-        │ (DMA RX Ring)
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│                  XDP HOOK (Kernel Space)                  │
-│                                                           │
-│  1. Kiểm tra biên gói tin (Bounds Check)                  │
-│  2. Parse Ethernet Header ──► Không phải IPv4? ──► XDP_PASS│
-│  3. Parse IPv4 Header     ──► Cập nhật Global Stats       │
-│  4. Kiểm tra IP nguồn có trong Blacklist Map không?       │
-│        ├──► Có & Chưa hết hạn chặn ──────────────► XDP_DROP│
-│        └──► Hết hạn chặn ──► Xóa khỏi Blacklist           │
-│  5. Không phải giao thức TCP? ───────────────────► XDP_PASS│
-│  6. Parse TCP Header:                                     │
-│        ├──► Không phải gói SYN thuần túy? ───────► XDP_PASS│
-│        └──► Là gói SYN (SYN=1, ACK=0):                    │
-│               ├──► Kiểm tra cửa sổ thời gian 1 giây       │
-│               ├──► Tăng biến đếm SYN của IP nguồn         │
-│               └──► Vượt ngưỡng (Threshold)?               │
-│                      ├──► Đúng: Thêm vào Blacklist ──► XDP_DROP
-│                      └──► Sai:  Cho phép đi tiếp   ──► XDP_PASS
-└───────────────────────────────────────────────────────────┘
+ebpf-network-monitor/
+├── bpf/                        # Mã nguồn Kernel Space (XDP Programs)
+│   ├── xdp_pass.c              # Chương trình XDP tối giản kiểm thử luồng nhận gói tin
+│   ├── xdp_syn_counter.c       # Bộ đếm tổng gói tin TCP SYN toàn cục (PERCPU_ARRAY)
+│   ├── xdp_syn_by_ip.c         # Bộ đếm gói tin TCP SYN tách biệt theo từng IP nguồn (LRU_HASH)
+│   └── xdp_syn_blocker.c       # Bộ lọc bảo vệ: Whitelist, Blocklist (XDP_DROP) & đếm SYN theo IP
+├── src/                        # Mã nguồn User Space (Control Plane & Readers)
+│   ├── map_reader.c            # Đọc tổng SYN và tính tốc độ SYN/giây toàn cục
+│   ├── ip_reader.c             # Đọc và hiển thị bảng thống kê SYN/giây theo từng IP nguồn
+│   └── syn_defender.c          # Bộ điều khiển phát hiện vượt ngưỡng, tự động chặn & gỡ chặn IP
+└── README.md                   # Tài liệu kỹ thuật và nhật ký tiến độ dự án
 ```
 
----
+### 2.1. Chi tiết các file trong Kernel Space (`bpf/`)
 
-## 4. Thiết kế cấu trúc dữ liệu (eBPF Maps)
+1. **`bpf/xdp_pass.c`**
+   * **Mục đích:** Kiểm thử khả năng biên dịch bytecode eBPF, nạp (attach) và gỡ (detach) chương trình XDP trên card mạng `ens160`.
+   * **Chức năng:** Chấp nhận mọi gói tin đi vào và trả về `XDP_PASS` để chuyển tiếp lên tầng mạng bình thường của Linux.
+   * 
+   victim1@victim:~$ cat ~/ebpf-network-monitor/bpf/xdp_pass.c
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
 
-Để đảm bảo hiệu năng cao và tránh xung đột dữ liệu giữa các nhân CPU (Lock contention), hệ thống sử dụng 3 loại eBPF Maps chuyên biệt:
+SEC("xdp")
+int xdp_pass(struct xdp_md *ctx)
+{
+    return XDP_PASS;
+}
 
-1. **`global_stats_map` (`BPF_MAP_TYPE_PERCPU_ARRAY`):**
-   * **Mục đích:** Lưu trữ tổng số gói tin đã nhận (`rx_packets`), tổng số byte (`rx_bytes`), số gói bị chặn (`dropped_packets`) và số gói cho qua (`passed_packets`).
-   * **Lý do chọn `PERCPU_ARRAY`:** Mỗi nhân CPU có một bản sao bộ nhớ riêng biệt, giúp việc cập nhật biến đếm diễn ra hoàn toàn không cần khóa (Lock-free), tối ưu hóa tốc độ xử lý đa luồng. User space sẽ cộng dồn giá trị từ tất cả các nhân CPU khi đọc.
+char LICENSE[] SEC("license") = "GPL";
 
-2. **`syn_tracker_map` (`BPF_MAP_TYPE_LRU_HASH`):**
-   * **Mục đích:** Theo dõi tần suất gửi gói tin `SYN` của từng địa chỉ IP nguồn (`Key: uint32_t src_ip`, `Value: struct syn_rate_info`).
-   * **Lý do chọn `LRU_HASH` (Least Recently Used):** Khi kẻ tấn công sử dụng kỹ thuật giả mạo IP ngẫu nhiên (Random IP Spoofing), bảng băm sẽ nhanh chóng đầy. Cơ chế LRU tự động loại bỏ các địa chỉ IP cũ ít hoạt động nhất để nhường chỗ cho các IP mới mà không gây lỗi tràn bộ nhớ (`ENOMEM`).
+2. **`bpf/xdp_syn_counter.c`**
+   * **Mục đích:** Xây dựng nền tảng phân tích header gói tin (Ethernet $\rightarrow$ IPv4 $\rightarrow$ TCP) và đếm lưu lượng TCP SYN tổng.
+   * **Chức năng:** Kiểm tra cờ TCP (`tcp->syn == 1` và `tcp->ack == 0`). Nếu khớp, tăng bộ đếm trong map `syn_count` kiểu `BPF_MAP_TYPE_PERCPU_ARRAY` (mỗi nhân CPU ghi trên vùng nhớ riêng để tránh xung đột khóa lock).
+   victim1@victim:~$ cat ~/ebpf-network-monitor/bpf/xdp_syn_counter.c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include<linux/in.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
-3. **`blacklist_map` (`BPF_MAP_TYPE_LRU_HASH`):**
-   * **Mục đích:** Lưu trữ danh sách các địa chỉ IP đang bị phong tỏa kèm theo mốc thời gian hết hạn chặn (`Key: uint32_t src_ip`, `Value: uint64_t block_until_ns`).
-   * **Cơ chế tự phục hồi (Auto-unblock):** Thay vì chặn vĩnh viễn gây ảnh hưởng nếu chặn nhầm người dùng thật (False Positive), hệ thống áp dụng cơ chế chặn động trong khoảng thời gian cấu hình (ví dụ: 15 giây).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} syn_count SEC(".maps");
 
----
+SEC("xdp")
+int xdp_syn_counter(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
 
-## 5. Triển khai mã nguồn chi tiết (Kernel Space & User Space)
+    // 1. Kiểm tra Ethernet header
+    struct ethhdr *eth = data;
 
-Cấu trúc thư mục dự án:
-```text
-ebpf-syn-mitigator/
-├── common.h          # Định nghĩa cấu trúc dữ liệu dùng chung
-├── xdp_prog.c        # Mã nguồn chương trình XDP (Kernel Space)
-├── loader.c          # Chương trình điều khiển và giám sát (User Space)
-└── Makefile          # Kịch bản tự động hóa biên dịch
-```
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
 
-### 5.1. Tập tin dùng chung (`common.h`)
+    // Chỉ xử lý IPv4
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
 
-```c
-#ifndef __COMMON_H
-#define __COMMON_H
+    // 2. Kiểm tra IPv4 header
+    struct iphdr *ip = (void *)(eth + 1);
 
-#include <linux/types.h>
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
 
-/* Cấu hình ngưỡng bảo vệ mặc định */
-#define SYN_THRESHOLD_PER_SEC 100              // Tối đa 100 gói SYN/giây/IP
-#define BLOCK_DURATION_NS     15000000000ULL   // Thời gian chặn: 15 giây (tính bằng nano-giây)
-#define ONE_SEC_NS            1000000000ULL    // 1 giây = 10^9 nano-giây
-#define MAX_TRACKED_IPS       65536            // Số lượng IP tối đa trong bảng băm LRU
+    if (ip->ihl < 5)
+        return XDP_PASS;
 
-/* Cấu trúc lưu trữ thống kê lưu lượng toàn cục */
-struct datarec {
-    __u64 rx_packets;
-    __u64 rx_bytes;
-    __u64 dropped_packets;
-    __u64 passed_packets;
-};
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
 
-/* Cấu trúc theo dõi tốc độ gửi gói SYN của từng IP nguồn */
-struct syn_rate_info {
-    __u64 window_start_ns; // Thời điểm bắt đầu cửa sổ đo 1 giây
-    __u32 syn_count;       // Số lượng gói SYN đếm được trong cửa sổ hiện tại
-};
+    // Tính vị trí TCP header theo độ dài IPv4 header
+    struct tcphdr *tcp =
+        (void *)ip + (ip->ihl * 4);
 
-#endif /* __COMMON_H */
-```
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
 
-### 5.2. Chương trình nhân hệ điều hành (`xdp_prog.c`)
+    // 3. Chỉ đếm SYN ban đầu: SYN=1, ACK=0
+    if (tcp->syn && !tcp->ack) {
+        __u32 key = 0;
+        __u64 *count = bpf_map_lookup_elem(&syn_count, &key);
 
-```c
+        if (count)
+            (*count)++;
+    }
+
+    // 4. Không chặn packet
+    return XDP_PASS;
+}
+
+
+3. **`bpf/xdp_syn_by_ip.c`**
+   * **Mục đích:** Phân tách lưu lượng theo từng nguồn gửi để nhận diện chính xác địa chỉ IP nào đang tạo lưu lượng bất thường.
+   * **Chức năng:** Trích xuất trường IP nguồn (`ip->saddr`), tra cứu và cập nhật số lượng gói SYN vào map `syn_by_ip` kiểu `BPF_MAP_TYPE_LRU_HASH` (tối đa 10.000 IP, tự động giải phóng IP cũ ít hoạt động nhất khi bảng đầy).
+   tim1@victim:~$ cat ~/ebpf-network-monitor/bpf/xdp_syn_by_ip.c
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "common.h"
 
-/* 1. Map thống kê lưu lượng toàn cục (Per-CPU để tránh tranh chấp khóa) */
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, __u32);
-    __type(value, struct datarec);
-    __uint(max_entries, 1);
-} global_stats_map SEC(".maps");
-
-/* 2. Map theo dõi tần suất gói SYN theo IP nguồn */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, __u32);
-    __type(value, struct syn_rate_info);
-    __uint(max_entries, MAX_TRACKED_IPS);
-} syn_tracker_map SEC(".maps");
-
-/* 3. Map danh sách đen chứa các IP bị chặn và thời điểm mở khóa */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, __u32);
-    __type(value, __u64);
-    __uint(max_entries, MAX_TRACKED_IPS);
-} blacklist_map SEC(".maps");
-
-/* Hàm phụ trợ cập nhật thống kê */
-static __always_inline void update_stats(struct datarec *rec, __u64 bytes, int action) {
-    if (!rec) return;
-    rec->rx_packets++;
-    rec->rx_bytes += bytes;
-    if (action == XDP_DROP) {
-        rec->dropped_packets++;
-    } else if (action == XDP_PASS) {
-        rec->passed_packets++;
-    }
-}
+    __uint(max_entries, 10000);
+    __type(key, __u32);   // IPv4 nguồn (network byte order)
+    __type(value, __u64); // Tổng số gói SYN của IP này
+} syn_by_ip SEC(".maps");
 
 SEC("xdp")
-int xdp_syn_flood_mitigator(struct xdp_md *ctx) {
+int xdp_syn_by_ip(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-    void *data     = (void *)(long)ctx->data;
-    __u64 pkt_size = data_end - data;
 
-    __u32 stats_key = 0;
-    struct datarec *stats = bpf_map_lookup_elem(&global_stats_map, &stats_key);
-
-    /* Bước 1: Kiểm tra Ethernet Header */
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) {
-        return XDP_ABORTED;
-    }
-
-    /* Bỏ qua nếu không phải gói tin IPv4 */
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
-        update_stats(stats, pkt_size, XDP_PASS);
+    if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
-    }
 
-    /* Bước 2: Kiểm tra IPv4 Header */
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
+
     struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end) {
-        return XDP_ABORTED;
-    }
-
-    /* Tính toán độ dài thực tế của IP Header (xử lý trường hợp có IP Options) */
-    __u32 ip_hdr_len = ip->ihl * 4;
-    if (ip_hdr_len < sizeof(struct iphdr) || (void *)ip + ip_hdr_len > data_end) {
-        return XDP_ABORTED;
-    }
-
-    __u32 src_ip = ip->saddr;
-    __u64 now = bpf_ktime_get_ns();
-
-    /* Bước 3: Kiểm tra xem IP nguồn có đang nằm trong Blacklist không */
-    __u64 *block_until = bpf_map_lookup_elem(&blacklist_map, &src_ip);
-    if (block_until) {
-        if (now < *block_until) {
-            /* Vẫn đang trong thời gian phạt -> Hủy gói tin ngay lập tức */
-            update_stats(stats, pkt_size, XDP_DROP);
-            return XDP_DROP;
-        } else {
-            /* Đã hết hạn phạt -> Xóa khỏi danh sách đen */
-            bpf_map_delete_elem(&blacklist_map, &src_ip);
-        }
-    }
-
-    /* Nếu không phải giao thức TCP -> Cho phép đi qua */
-    if (ip->protocol != IPPROTO_TCP) {
-        update_stats(stats, pkt_size, XDP_PASS);
+    if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
-    }
 
-    /* Bước 4: Kiểm tra TCP Header */
-    struct tcphdr *tcp = (void *)ip + ip_hdr_len;
-    if ((void *)(tcp + 1) > data_end) {
-        return XDP_ABORTED;
-    }
+    if (ip->ihl < 5 || ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
 
-    /* Bước 5: Phát hiện gói tin khởi tạo kết nối TCP SYN thuần túy (SYN=1, ACK=0) */
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
+
     if (tcp->syn && !tcp->ack) {
-        struct syn_rate_info *rate = bpf_map_lookup_elem(&syn_tracker_map, &src_ip);
-        
-        if (!rate) {
-            /* Lần đầu ghi nhận IP này gửi gói SYN */
-            struct syn_rate_info new_rate = {
-                .window_start_ns = now,
-                .syn_count = 1
-            };
-            bpf_map_update_elem(&syn_tracker_map, &src_ip, &new_rate, BPF_ANY);
+        __u32 src_ip = ip->saddr;
+        __u64 *count = bpf_map_lookup_elem(&syn_by_ip, &src_ip);
+
+        if (count) {
+            __sync_fetch_and_add(count, 1);
         } else {
-            /* Kiểm tra xem đã sang cửa sổ 1 giây mới chưa */
-            if (now - rate->window_start_ns > ONE_SEC_NS) {
-                rate->window_start_ns = now;
-                rate->syn_count = 1;
-            } else {
-                rate->syn_count++;
-                /* Nếu vượt ngưỡng cho phép trong 1 giây -> Đưa vào Blacklist */
-                if (rate->syn_count > SYN_THRESHOLD_PER_SEC) {
-                    __u64 expire_time = now + BLOCK_DURATION_NS;
-                    bpf_map_update_elem(&blacklist_map, &src_ip, &expire_time, BPF_ANY);
-                    
-                    update_stats(stats, pkt_size, XDP_DROP);
-                    return XDP_DROP;
-                }
-            }
+            __u64 init_val = 1;
+            bpf_map_update_elem(&syn_by_ip, &src_ip, &init_val, BPF_ANY);
         }
     }
 
-    /* Gói tin hợp lệ -> Cho phép đi tiếp lên Linux Network Stack */
-    update_stats(stats, pkt_size, XDP_PASS);
     return XDP_PASS;
 }
 
-char _license[] SEC("license") = "GPL";
-```
+char LICENSE[] SEC("license") = "GPL";
 
-### 5.3. Chương trình điều khiển và giám sát (`loader.c`)
+4. **`bpf/xdp_syn_blocker.c`**
+   * **Mục đích:** Thực thi cơ chế ngăn chặn tấn công TCP SYN Flood trực tiếp tại tầng XDP với độ trễ cực thấp (phục vụ **Kịch bản 3**).
+   * **Chức năng:** Sử dụng 4 BPF Maps phối hợp theo thứ tự ưu tiên:
+     * `whitelist` (`HASH`): Cho phép IP tin cậy đi qua ngay lập tức (`XDP_PASS`), chống chặn nhầm quản trị viên.
+     * `blocklist` (`HASH`): Nếu IP nguồn có mặt trong danh sách đen, tăng bộ đếm `drop_count` (`PERCPU_ARRAY`) và hủy gói tin ngay lập tức bằng **`XDP_DROP`** (chặn cả TCP lẫn ICMP ping từ kẻ tấn công).
+     * `syn_by_ip` (`LRU_HASH`): Tiếp tục thống kê gói TCP SYN cho các IP chưa bị chặn để User Space giám sát.
+     victim1@victim:~$ cat ~/ebpf-network-monitor/bpf/xdp_syn_by_ip.c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/in.h>
 
-```c
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <errno.h>
-#include <time.h>
-#include <net/if.h>
-#include <arpa/inet.h>
-#include <linux/if_link.h>
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
-#include "common.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
-static volatile bool exiting = false;
-static int ifindex = 0;
-static __u32 xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);   // IPv4 nguồn (network byte order)
+    __type(value, __u64); // Tổng số gói SYN của IP này
+} syn_by_ip SEC(".maps");
 
-/* Bắt tín hiệu Ctrl+C để gỡ chương trình XDP an toàn trước khi thoát */
-static void sig_handler(int sig) {
-    exiting = true;
-}
+SEC("xdp")
+int xdp_syn_by_ip(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
 
-/* Đọc và cộng dồn dữ liệu từ Per-CPU Array Map */
-static int get_total_stats(int map_fd, struct datarec *total) {
-    unsigned int nr_cpus = libbpf_num_possible_cpus();
-    struct datarec values[nr_cpus];
-    __u32 key = 0;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
 
-    memset(total, 0, sizeof(*total));
-    if (bpf_map_lookup_elem(map_fd, &key, values) != 0) {
-        return -1;
-    }
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
 
-    for (unsigned int i = 0; i < nr_cpus; i++) {
-        total->rx_packets      += values[i].rx_packets;
-        total->rx_bytes        += values[i].rx_bytes;
-        total->dropped_packets += values[i].dropped_packets;
-        total->passed_packets  += values[i].passed_packets;
-    }
-    return 0;
-}
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
 
-/* Lấy thời gian monotonic của hệ thống (khớp với bpf_ktime_get_ns) */
-static __u64 get_ktime_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
+    if (ip->ihl < 5 || ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
 
-/* Duyệt và hiển thị danh sách IP đang bị chặn */
-static void print_blacklisted_ips(int blacklist_fd) {
-    __u32 key = 0, next_key;
-    __u64 block_until;
-    __u64 now = get_ktime_ns();
-    int count = 0;
-    char ip_str[INET_ADDRSTRLEN];
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
 
-    printf("\n--- DANH SÁCH IP ĐANG BỊ CHẶN (BLACKLIST) ---\n");
-    while (bpf_map_get_next_key(blacklist_fd, count == 0 ? NULL : &key, &next_key) == 0) {
-        key = next_key;
-        if (bpf_map_lookup_elem(blacklist_fd, &key, &block_until) == 0) {
-            if (now < block_until) {
-                inet_ntop(AF_INET, &key, ip_str, sizeof(ip_str));
-                double remain = (double)(block_until - now) / 1e9;
-                printf("  [BLOCKED] %-15s | Thời gian mở khóa còn lại: %.1f giây\n", ip_str, remain);
-                count++;
-            }
-        }
-        if (count >= 15) {
-            printf("  ... (và các IP khác)\n");
-            break;
-        }
-    }
-    if (count == 0) {
-        printf("  (Không có IP nào đang bị chặn - Hệ thống an toàn)\n");
-    }
-}
+    if (tcp->syn && !tcp->ack) {
+        __u32 src_ip = ip->saddr;
+        __u64 *count = bpf_map_lookup_elem(&syn_by_ip, &src_ip);
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Cách sử dụng: sudo %s <tên_card_mạng> [skb|drv]\n", argv[0]);
-        fprintf(stderr, "Ví dụ:        sudo %s eth0 drv\n", argv[0]);
-        return 1;
-    }
-
-    const char *ifname = argv[1];
-    ifindex = if_nametoindex(ifname);
-    if (!ifindex) {
-        perror("Lỗi tìm kiếm card mạng (if_nametoindex)");
-        return 1;
-    }
-
-    /* Lựa chọn chế độ gắn XDP (Mặc định thử Native Mode, nếu lỗi dùng Generic SKB Mode) */
-    bool force_skb = (argc >= 3 && strcmp(argv[2], "skb") == 0);
-    if (force_skb) {
-        xdp_flags |= XDP_FLAGS_SKB_MODE;
-    } else {
-        xdp_flags |= XDP_FLAGS_DRV_MODE;
-    }
-
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-
-    /* 1. Mở đối tượng eBPF đã biên dịch */
-    struct bpf_object *obj = bpf_object__open_file("xdp_prog.o", NULL);
-    if (libbpf_get_error(obj)) {
-        fprintf(stderr, "Lỗi: Không thể mở file xdp_prog.o\n");
-        return 1;
-    }
-
-    /* 2. Nạp chương trình và khởi tạo Maps vào Kernel */
-    if (bpf_object__load(obj)) {
-        fprintf(stderr, "Lỗi: Không thể nạp chương trình eBPF vào Kernel\n");
-        bpf_object__close(obj);
-        return 1;
-    }
-
-    /* 3. Tìm chương trình XDP theo tên hàm */
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_syn_flood_mitigator");
-    if (!prog) {
-        fprintf(stderr, "Lỗi: Không tìm thấy hàm xdp_syn_flood_mitigator\n");
-        bpf_object__close(obj);
-        return 1;
-    }
-    int prog_fd = bpf_program__fd(prog);
-
-    /* 4. Gắn chương trình XDP vào card mạng */
-    if (bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL) < 0) {
-        if (!force_skb) {
-            printf("Cảnh báo: Driver %s không hỗ trợ Native XDP, tự động chuyển sang Generic Mode (SKB)...\n", ifname);
-            xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE;
-            if (bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL) < 0) {
-                perror("Lỗi gắn XDP vào card mạng");
-                bpf_object__close(obj);
-                return 1;
-            }
+        if (count) {
+            __sync_fetch_and_add(count, 1);
         } else {
-            perror("Lỗi gắn XDP vào card mạng");
-            bpf_object__close(obj);
-            return 1;
+            __u64 init_val = 1;
+            bpf_map_update_elem(&syn_by_ip, &src_ip, &init_val, BPF_ANY);
         }
     }
 
-    int stats_fd     = bpf_object__find_map_fd_by_name(obj, "global_stats_map");
-    int blacklist_fd = bpf_object__find_map_fd_by_name(obj, "blacklist_map");
+    return XDP_PASS;
+}
 
-    struct datarec prev = {0}, curr = {0};
-    get_total_stats(stats_fd, &prev);
+char LICENSE[] SEC("license") = "GPL";
 
-    /* 5. Vòng lặp giám sát thời gian thực */
-    while (!exiting) {
-        sleep(1);
-        if (get_total_stats(stats_fd, &curr) != 0) continue;
+### 2.2. Chi tiết các file trong User Space (`src/`)
 
-        __u64 pps      = curr.rx_packets - prev.rx_packets;
-        __u64 bps      = (curr.rx_bytes - prev.rx_bytes) * 8;
-        __u64 drop_pps = curr.dropped_packets - prev.dropped_packets;
-        __u64 pass_pps = curr.passed_packets - prev.passed_packets;
+1. **`src/map_reader.c`**
+   * **Mục đích:** Kiểm chứng khả năng đọc dữ liệu đa nhân (Per-CPU) từ Kernel lên User Space.
+   * **Chức năng:** Tìm map `syn_count` bằng `libbpf`, cộng dồn giá trị trên toàn bộ số nhân CPU khả dụng (128 possible CPUs) mỗi giây và tính toán tốc độ `SYN/giây`.
+   ictim1@victim:~$ cat ~/ebpf-network-monitor/bpf/xdp_syn_blocker.c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/in.h>
 
-        /* Xóa màn hình terminal và in bảng điều khiển */
-        printf("\033[H\033[J");
-        printf("=================================================================\n");
-        printf("  eBPF/XDP NETWORK MONITOR & TCP SYN FLOOD MITIGATOR             \n");
-        printf("=================================================================\n");
-        printf("  Giao diện mạng : %-10s | Chế độ : %s\n", 
-               ifname, (xdp_flags & XDP_FLAGS_SKB_MODE) ? "Generic (SKB)" : "Native (Driver)");
-        printf("  Ngưỡng chặn    : %d SYN/giây/IP | Thời gian phạt: %llu giây\n", 
-               SYN_THRESHOLD_PER_SEC, BLOCK_DURATION_NS / 1000000000ULL);
-        printf("-----------------------------------------------------------------\n");
-        printf("  Tốc độ nhận (RX)   : %12llu pps  (%.2f Mbps)\n", pps, (double)bps / 1e6);
-        printf("  Gói hợp lệ (PASS)  : %12llu pps  (Tổng: %llu)\n", pass_pps, curr.passed_packets);
-        printf("  Gói bị chặn (DROP) : %12llu pps  (Tổng: %llu)\n", drop_pps, curr.dropped_packets);
-        printf("=================================================================\n");
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
-        print_blacklisted_ips(blacklist_fd);
-        printf("\nNhấn Ctrl+C để dừng và gỡ chương trình XDP...\n");
+// 1. Map đếm số gói SYN theo từng IP nguồn
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);
+    __type(value, __u64);
+} syn_by_ip SEC(".maps");
 
-        prev = curr;
+// 2. Map danh sách IP bị chặn (value = thời điểm hết hạn hoặc cờ 1)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);
+    __type(value, __u64);
+} blocklist SEC(".maps");
+
+// 3. Map danh sách IP được bảo vệ (không bao giờ bị chặn nhầm)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u8);
+} whitelist SEC(".maps");
+
+// 4. Map đếm tổng số gói tin đã bị XDP_DROP (PERCPU để đạt hiệu năng cao)
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} drop_count SEC(".maps");
+
+SEC("xdp")
+int xdp_syn_blocker(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    if (ip->ihl < 5)
+        return XDP_PASS;
+
+    __u32 src_ip = ip->saddr;
+
+    // Ưu tiên 1: Nếu thuộc whitelist -> cho qua ngay lập tức
+    if (bpf_map_lookup_elem(&whitelist, &src_ip))
+        return XDP_PASS;
+
+    // Ưu tiên 2: Nếu nằm trong blocklist -> DROP ngay lập tức (chặn cả ICMP lẫn TCP)
+    if (bpf_map_lookup_elem(&blocklist, &src_ip)) {
+        __u32 zero = 0;
+        __u64 *drops = bpf_map_lookup_elem(&drop_count, &zero);
+        if (drops)
+            (*drops)++;
+        return XDP_DROP;
     }
 
-    /* 6. Dọn dẹp tài nguyên khi thoát */
-    printf("\nĐang gỡ chương trình XDP khỏi %s...\n", ifname);
-    bpf_xdp_detach(ifindex, xdp_flags, NULL);
-    bpf_object__close(obj);
-    printf("Đã hoàn tất dọn dẹp an toàn.\n");
+    // Ưu tiên 3: Theo dõi gói TCP SYN ban đầu (SYN=1, ACK=0)
+    if (ip->protocol != IPPROTO_TCP)
+        return XDP_PASS;
 
-    return 0;
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
+
+    if (tcp->syn && !tcp->ack) {
+        __u64 *count = bpf_map_lookup_elem(&syn_by_ip, &src_ip);
+        if (count) {
+            __sync_fetch_and_add(count, 1);
+        } else {
+            __u64 init_val = 1;
+            bpf_map_update_elem(&syn_by_ip, &src_ip, &init_val, BPF_ANY);
+        }
+    }
+
+    return XDP_PASS;
 }
+
+char LICENSE[] SEC("license") = "GPL";
+
+2. **`src/ip_reader.c`**
+   * **Mục đích:** Giám sát trực quan lưu lượng SYN theo từng địa chỉ IP theo thời gian thực.
+   * **Chức năng:** Duyệt toàn bộ danh sách khóa (`bpf_map_get_next_key`) trong `syn_by_ip`, chuyển đổi IP từ dạng nhị phân sang chuỗi IPv4 (`inet_ntop`), và in bảng thống kê gồm: `IP Nguồn`, `Tổng SYN`, và `Tốc độ (SYN/s)`.
+
+3. **`src/syn_defender.c`**
+   * **Mục đích:** Đóng vai trò bộ não tự động hóa (Control Plane) cho cơ chế phát hiện và giảm thiểu tấn công.
+   * **Chức năng:**
+     * Nạp danh sách IP bảo vệ vào `whitelist` qua tham số dòng lệnh.
+     * Giám sát tốc độ `SYN/s` của từng IP mỗi giây; nếu vượt ngưỡng cảnh báo (**`> 50 SYN/s`**), tự động ghi IP đó vào `blocklist` trong Kernel.
+     * Quản lý bộ đếm thời gian phạt (**`20 giây`**); tự động xóa IP khỏi `blocklist` (`bpf_map_delete_elem`) khi hết hạn để khôi phục kết nối.
+
+---
+
+## 3. Hướng dẫn biên dịch và vận hành
+
+### 3.1. Biên dịch mã nguồn
+```bash
+# Biên dịch Kernel Space (eBPF bytecode)
+clang -O2 -g -target bpf -c ~/ebpf-network-monitor/bpf/xdp_syn_blocker.c -o ~/ebpf-network-monitor/bpf/xdp_syn_blocker.o
+
+# Biên dịch User Space (libbpf)
+gcc -O2 -Wall ~/ebpf-network-monitor/src/syn_defender.c -o ~/ebpf-network-monitor/src/syn_defender -lbpf -lelf -lz
 ```
 
-### 5.4. Kịch bản biên dịch (`Makefile`)
+### 3.2. Gắn chương trình XDP và chạy bộ phòng thủ trên `victim1`
+```bash
+# Gỡ chương trình XDP cũ (nếu có) và nạp xdp_syn_blocker lên ens160
+sudo ip link set dev ens160 xdpgeneric off 2>/dev/null || true
+sudo ip link set dev ens160 xdpgeneric obj ~/ebpf-network-monitor/bpf/xdp_syn_blocker.o sec xdp
 
-```makefile
-CLANG ?= clang
-CC ?= gcc
-ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+# Kiểm tra trạng thái attach và các BPF Maps
+sudo ip -details link show ens160 | grep prog/xdp
+sudo bpftool map show | grep -E "syn_by_ip|blocklist|whitelist|drop_count"
 
-BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -Wall
-USER_CFLAGS := -O2 -g -Wall
-LDFLAGS := -lbpf -lelf -lz
+# Chạy syn_defender (có thể truyền kèm IP whitelist ở phía sau)
+sudo ~/ebpf-network-monitor/src/syn_defender 192.168.1.14
+```
 
-all: xdp_prog.o loader
+### 3.3. Lệnh kiểm thử tấn công từ Kali Linux (Root Terminal)
+```bash
+# Tab 1: Theo dõi kết nối liên tục tới victim1
+ping <IP_VICTIM1>
 
-xdp_prog.o: xdp_prog.c common.h
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-loader: loader.c common.h
-	$(CC) $(USER_CFLAGS) $< -o $@ $(LDFLAGS)
-
-clean:
-	rm -f xdp_prog.o loader
+# Tab 2: Bắn TCP SYN Flood tốc độ 200 gói/giây (vượt ngưỡng 50 SYN/s)
+hping3 -S -p 80 -i u5000 <IP_VICTIM1>
 ```
 
 ---
 
-## 6. Quy trình biên dịch và Hướng dẫn vận hành
+## 4. Tiến độ triển khai & Kết quả kiểm chứng
 
-### 6.1. Yêu cầu môi trường
-* **Hệ điều hành:** Ubuntu 22.04 LTS / 24.04 LTS hoặc Debian 12 (Nhân Linux phiên bản $\ge 5.15$).
-* **Các gói thư viện cần thiết:**
-  ```bash
-  sudo apt update
-  sudo apt install -y clang llvm libelf-dev libbpf-dev gcc make linux-headers-$(uname -r) linux-tools-common linux-tools-$(uname -r)
-  ```
+### Các hạng mục đã hoàn thành
+- [x] **Giai đoạn 1 (Cơ sở hạ tầng & XDP cơ bản):** Cài đặt môi trường eBPF/libbpf trên Ubuntu 24.04, xây dựng và kiểm thử thành công `xdp_pass.c`.
+- [x] **Giai đoạn 2 (Đếm lưu lượng tổng):** Hoàn thiện `xdp_syn_counter.c` và `map_reader.c`, xác minh cộng dồn chính xác số gói SYN trên 128 possible CPUs và tính tốc độ theo giây.
+- [x] **Giai đoạn 3 (Phân tách theo IP nguồn):** Hoàn thiện `xdp_syn_by_ip.c` và `ip_reader.c` sử dụng `LRU_HASH`. Chuyển đổi mô hình mạng 3 máy sang **Bridged LAN**, phân tách thành công lưu lượng từ Windows (`192.168.1.14`) và Kali Linux (`192.168.1.17`).
+- [x] **Giai đoạn 4 (Hoàn thiện code Kịch bản 3 - Phát hiện & Chặn IP):** Xây dựng hoàn chỉnh `xdp_syn_blocker.c` và `syn_defender.c` hỗ trợ `whitelist`, phát hiện ngưỡng `50 SYN/s`, tự động chặn bằng `XDP_DROP` và tự động gỡ chặn sau `20 giây`.
 
-### 6.2. Các bước biên dịch và khởi chạy
-1. **Biên dịch mã nguồn:**
-   ```bash
-   make
-   ```
-   Kết quả sẽ sinh ra 2 tệp tin: `xdp_prog.o` (eBPF bytecode) và `loader` (tệp thực thi User Space).
+### Kế hoạch thực nghiệm tiếp theo (Benchmark & Đánh giá)
+- [ ] **Kịch bản 3 (Nghiệm thu log thực tế):** Chạy kiểm thử đồng thời 3 máy (Windows truy cập HTTP, Kali bắn `hping3` và `ping`), ghi nhận thời điểm kích hoạt `[ALERT -> BLOCK]`, số gói `XDP_DROP` và thời điểm tự động `[UNBAN]`.
+![alt text](<kịch bản 3-1.png>)
 
-2. **Xác định tên giao diện mạng:**
-   ```bash
-   ip -br a
-   ```
-   *(Ví dụ: `eth0`, `ens33`, hoặc `lo` nếu chạy thử nghiệm cục bộ).*
+- [ ] **Kịch bản 1 (Hiệu năng bình thường):** Đo mức tiêu thụ CPU, độ trễ HTTP và thông lượng ở 3 chế độ: *Baseline* vs. *iptables* vs. *XDP*.
+![alt text](<kịch bản 2-2.png>)
+- [ ] **Kịch bản 2 (Giảm thiểu SYN Flood):** So sánh khả năng chịu tải và tỷ lệ phục vụ client hợp lệ khi hứng chịu SYN Flood cường độ cao (`--flood`).
 
-3. **Khởi chạy hệ thống phòng thủ:**
-   ```bash
-   sudo ./loader eth0
-   ```
-   *(Lưu ý: Quyền `root` hoặc `CAP_BPF` + `CAP_NET_ADMIN` là bắt buộc để nạp chương trình vào nhân).*
-
----
-
-## 7. Kịch bản kiểm thử, Đánh giá hiệu năng và Phân tích kết quả
-
-### 7.1. Mô hình môi trường kiểm thử (Lab Topology)
-* **Máy mục tiêu (Target Server):** Ubuntu 22.04, 4 vCPU, 8GB RAM, chạy dịch vụ web Nginx tại cổng `80` và chạy chương trình `ebpf-syn-mitigator`.
-* **Máy tấn công (Attacker):** Kali Linux sử dụng công cụ `hping3` để phát sinh lưu lượng tấn công TCP SYN Flood.
-* **Máy người dùng hợp lệ (Legitimate Client):** Sử dụng `curl` để kiểm tra khả năng truy cập dịch vụ web trong lúc đang bị tấn công.
-
-### 7.2. Kịch bản kiểm thử thực tế
-
-#### Giai đoạn 1: Trạng thái bình thường (Baseline)
-* Máy Client gửi truy vấn HTTP liên tục tới Server: `curl -I http://<IP_Server>`
-* **Kết quả:** Server phản hồi mã `200 OK` tức thì. Bảng điều khiển XDP ghi nhận toàn bộ gói tin ở trạng thái `PASS`, danh sách Blacklist trống.
-
-#### Giai đoạn 2: Kích hoạt tấn công TCP SYN Flood
-* Trên máy Attacker, thực hiện lệnh bắn gói tin `SYN` tốc độ cao (Flood mode) vào cổng 80:
-  ```bash
-  sudo hping3 -S -p 80 --flood <IP_Server>
-  ```
-* **Quan sát trên Server:**
-  * Ngay tại giây đầu tiên, số lượng gói tin `SYN` từ IP của Attacker vượt ngưỡng `100 pps`.
-  * Chương trình XDP lập tức đưa IP của Attacker vào `blacklist_map` với thời gian phạt 15 giây.
-  * Hàng trăm nghìn gói tin tấn công mỗi giây bị hủy ngay lập tức tại tầng Driver (`XDP_DROP`).
-  * Máy Client hợp lệ vẫn truy cập `curl -I http://<IP_Server>` bình thường với độ trễ gần như không đổi.
-
-### 7.3. Bảng so sánh hiệu năng (Benchmark)
-
-Dưới đây là kết quả đo lường tài nguyên hệ thống trên cùng một phần cứng khi hứng chịu luồng tấn công cường độ $500,000\text{ PPS}$ (gói tin/giây):
-
-| Tiêu chí đánh giá | Không có tường lửa | Sử dụng `iptables` (`DROP`) | Sử dụng `eBPF/XDP` (Native) |
-| :--- | :---: | :---: | :---: |
-| **Mức tiêu thụ CPU (SoftIRQ)** | $100\%$ (Treo hệ thống) | $\sim 88\% - 95\%$ | **$\sim 12\% - 18\%$** |
-| **Bộ nhớ RAM tiêu thụ cho mạng** | Cạn kiệt (Tràn SYN Queue) | Cao (Cấp phát `sk_buff`) | **Cực thấp (Không cấp phát `sk_buff`)** |
-| **Khả năng truy cập của Client thật** | Mất kết nối hoàn toàn | Chập chờn, độ trễ cao | **Ổn định, phản hồi tức thì** |
-| **Tốc độ lọc gói tin tối đa** | Không áp dụng | $\sim 450\text{ Kpps}$ | **$> 5\text{ Mpps}$ (gấp $>10$ lần)** |
-
----
-
-## 8. Hạn chế hiện tại và Hướng phát triển
-
-### 8.1. Hạn chế của phiên bản hiện tại
-1. **Chưa hỗ trợ IPv6:** Mã nguồn hiện tại mới chỉ phân tích header `ETH_P_IP` (IPv4) và cho qua các gói tin `ETH_P_IPV6`.
-2. **Tấn công giả mạo IP phân tán quy mô cực lớn (Random IP Spoofing):** Nếu kẻ tấn công giả mạo hàng triệu địa chỉ IP khác nhau và mỗi IP chỉ gửi dưới ngưỡng `100 SYN/s`, cơ chế đếm theo từng IP đơn lẻ có thể bị qua mặt.
-
-### 8.2. Hướng phát triển trong tương lai
-1. **Triển khai cơ chế SYN Cookies ở tầng XDP (`XDP SYNPROXY`):** Thay vì chỉ dựa vào ngưỡng đếm IP, chương trình XDP sẽ tự tính toán mã băm mật mã (SYN Cookie) và dùng hành động `XDP_TX` để trả lời gói `SYN-ACK` trực tiếp từ card mạng, chỉ cho phép kết nối đi vào nhân Linux khi Client gửi lại gói `ACK` hợp lệ.
-2. **Mở rộng hỗ trợ IPv6:** Bổ sung bộ phân tích cú pháp cho header `struct ipv6hdr`.
-3. **Tích hợp Prometheus & Grafana:** Xuất các chỉ số từ `global_stats_map` ra chuẩn HTTP Metrics để vẽ biểu đồ giám sát tập trung trên nền tảng web.
+![alt text](<kịch bản 2-1.png>)
+- [ ] **Kịch bản 4 (Chặn nhầm & Độ bền):** Chạy tải HTTP hợp lệ cường độ cao song song với lưu lượng tấn công trong thời gian dài để kiểm tra tỷ lệ *False Positive* và độ ổn định bộ nhớ của `LRU_HASH`.
+![alt text](<kịch bản 4-1.png>)
+![alt text](<kịch bản 4.1-1.png>)
+![alt text](<kịch bản 4.2-1.png>)
+![alt text](<kịch bản 4.3-1.png>)
+![alt text](<kịch bản 4.4-1.png>)
