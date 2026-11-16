@@ -15,8 +15,8 @@ Tất cả các máy tham gia thực nghiệm được cấu hình ở chế đ�
 
 | Vai trò | Hệ điều hành / Nền tảng | Card mạng | Địa chỉ IP | Chức năng trong kịch bản |
 | :--- | :--- | :--- | :--- | :--- |
-| **Victim / Defender** | Ubuntu Server 24.04 (`victim1`) | `ens160` | `192.168.1.x` | Máy chủ mục tiêu chạy web service & gắn bộ lọc XDP/eBPF |
-| **Legitimate Client** | Windows 11 (Host vật lý) | Wi-Fi / LAN | `192.168.1.14` | Người dùng hợp lệ gửi truy cập HTTP/TCP bình thường |
+| **Victim / Defender** | Ubuntu Server 24.04 (`victim1`) | `ens160` | `192.168.1.5` | Máy chủ mục tiêu chạy web service & gắn bộ lọc XDP/eBPF |
+| **Legitimate Client** | Windows 11 (Host vật lý) | Wi-Fi / LAN | `192.168.1.3` | Người dùng hợp lệ gửi truy cập HTTP/TCP bình thường |
 | **Attacker** | Kali Linux (VM trên máy vật lý 2) | `eth0` | `192.168.1.17` | Máy tấn công sử dụng `hping3` phát lưu lượng TCP SYN Flood |
 
 ---
